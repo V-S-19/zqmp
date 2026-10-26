@@ -2,8 +2,22 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BUNDLED_DB_PATH = os.path.join(ROOT_DIR, "data", "energy_trading.db")
+app_dir = os.path.dirname(os.path.abspath(__file__))
+backend_dir = os.path.dirname(app_dir)
+root_dir = os.path.dirname(backend_dir)
+
+candidates = [
+    os.path.join(backend_dir, "data", "energy_trading.db"),
+    os.path.join(root_dir, "data", "energy_trading.db"),
+    os.path.join(os.getcwd(), "data", "energy_trading.db"),
+    os.path.join(os.getcwd(), "backend", "data", "energy_trading.db"),
+]
+
+BUNDLED_DB_PATH = candidates[0]
+for p in candidates:
+    if os.path.exists(p):
+        BUNDLED_DB_PATH = p
+        break
 
 if os.environ.get("VERCEL"):
     import shutil
@@ -11,7 +25,7 @@ if os.environ.get("VERCEL"):
     if not os.path.exists(TMP_DB_PATH) and os.path.exists(BUNDLED_DB_PATH):
         try:
             shutil.copyfile(BUNDLED_DB_PATH, TMP_DB_PATH)
-        except Exception as e:
+        except Exception:
             pass
     DATABASE_PATH = TMP_DB_PATH if os.path.exists(TMP_DB_PATH) else BUNDLED_DB_PATH
 else:
