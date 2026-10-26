@@ -1,6 +1,9 @@
 from sqlalchemy import Column, Integer, Float, String, DateTime, Index
 from datetime import datetime
-from backend.app.database import Base
+try:
+    from backend.app.database import Base
+except ImportError:
+    from app.database import Base
 
 class SettlementRecord(Base):
     __tablename__ = "settlement_records"

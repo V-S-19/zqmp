@@ -1,27 +1,49 @@
 import os
+import sys
 import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, APIRouter, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
-from backend.app.database import get_db, engine, Base
-from backend.app.models import SettlementRecord, MetricRecord
-from backend.app.schemas import (
-    MetricResponse,
-    TimeseriesResponse,
-    TimeseriesPoint,
-    ErrorDistributionResponse,
-    ErrorDistributionBucket,
-    ProcurementSimRequest,
-    ProcurementSimResponse
-)
+# Ensure both backend/ and project root are in sys.path
+app_dir = os.path.dirname(os.path.abspath(__file__))
+backend_dir = os.path.dirname(app_dir)
+repo_root = os.path.dirname(backend_dir)
+for p in [backend_dir, repo_root]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from backend.app.database import get_db, engine, Base
+    from backend.app.models import SettlementRecord, MetricRecord
+    from backend.app.schemas import (
+        MetricResponse,
+        TimeseriesResponse,
+        TimeseriesPoint,
+        ErrorDistributionResponse,
+        ErrorDistributionBucket,
+        ProcurementSimRequest,
+        ProcurementSimResponse
+    )
+except ImportError:
+    from app.database import get_db, engine, Base
+    from app.models import SettlementRecord, MetricRecord
+    from app.schemas import (
+        MetricResponse,
+        TimeseriesResponse,
+        TimeseriesPoint,
+        ErrorDistributionResponse,
+        ErrorDistributionBucket,
+        ProcurementSimRequest,
+        ProcurementSimResponse
+    )
 
 # Ensure database tables exist
 Base.metadata.create_all(bind=engine)
@@ -41,7 +63,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/api/health")
+# Router for endpoints
+router = APIRouter()
+
+@router.get("/health")
 def health_check():
     return {
         "status": "healthy",
@@ -49,12 +74,11 @@ def health_check():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
-@app.get("/api/metrics", response_model=MetricResponse)
+@router.get("/metrics", response_model=MetricResponse)
 def get_metrics(db: Session = Depends(get_db)):
     """Returns global January 2026 performance KPIs."""
     metric_rows = db.query(MetricRecord).all()
     if not metric_rows:
-        # Fallback query directly from settlement records
         count = db.query(SettlementRecord).count()
         if count == 0:
             raise HTTPException(status_code=404, detail="No settlement records found. Run the ingestion pipeline first.")
@@ -103,13 +127,12 @@ def get_metrics(db: Session = Depends(get_db)):
         total_settlement_periods=int(m.get("TOTAL_SETTLEMENT_PERIODS", 0))
     )
 
-@app.get("/api/timeseries", response_model=TimeseriesResponse)
+@router.get("/timeseries", response_model=TimeseriesResponse)
 def get_timeseries(
     date: Optional[str] = Query(None, description="Settlement date in YYYY-MM-DD format"),
     db: Session = Depends(get_db)
 ):
     """Returns settlement periods for a given date, plus list of all available January 2026 dates."""
-    # Query distinct available dates
     available_dates = [
         d[0] for d in db.query(SettlementRecord.settlement_date).distinct().order_by(SettlementRecord.settlement_date).all()
     ]
@@ -160,7 +183,7 @@ def get_timeseries(
         data=data_points
     )
 
-@app.get("/api/error-distribution", response_model=ErrorDistributionResponse)
+@router.get("/error-distribution", response_model=ErrorDistributionResponse)
 def get_error_distribution(
     bins_count: int = Query(20, ge=5, le=50),
     db: Session = Depends(get_db)
@@ -204,18 +227,12 @@ def get_error_distribution(
         buckets=buckets
     )
 
-@app.post("/api/simulate-procurement", response_model=ProcurementSimResponse)
+@router.post("/simulate-procurement", response_model=ProcurementSimResponse)
 def simulate_procurement(
     req: ProcurementSimRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Trader Procurement Sandbox:
-    Given consumer demand and target delivery slot (Settlement Period), computes
-    the recommended Day-Ahead Thermal Power to Procure with explicit risk buffers:
-      - Risk-Neutral (P50): Accounts for median forecast deviation
-      - Risk-Averse (P90): Reserves safety margin based on P10 wind deficit threshold
-    """
+    """Trader Procurement Sandbox: computes optimal Day-Ahead Thermal Power to Procure."""
     record = (
         db.query(SettlementRecord)
         .filter(
@@ -225,7 +242,6 @@ def simulate_procurement(
         .first()
     )
 
-    # If exact period not found, take closest or average for that period
     if not record:
         record = (
             db.query(SettlementRecord)
@@ -236,7 +252,6 @@ def simulate_procurement(
     expected_wind = record.forecast_generation_mw if record else 10000.0
     actual_wind = record.actual_generation_mw if record else None
 
-    # Fetch global metrics for percentile buffers
     all_errors = [r[0] for r in db.query(SettlementRecord.error_mw).all()]
     if all_errors:
         p10_error = float(np.percentile(all_errors, 10))
@@ -245,33 +260,26 @@ def simulate_procurement(
         p10_error = -3500.0
         p50_error = -1500.0
 
-    # Determine Safety Buffer (MW)
-    # Wind Deficit Risk: Error = Actual - Forecast. If Actual < Forecast, Error is negative.
-    # To be 90% confident that wind >= hedged volume, hedge = Forecast + P10 (where P10 is negative, so buffer = |P10|)
     if req.custom_buffer_mw is not None:
         buffer_mw = req.custom_buffer_mw
         risk_mode = "Custom"
     elif req.risk_tolerance.upper() == "P90":
-        # 90% confidence against wind shortfall: buffer = |P10_error|
         buffer_mw = abs(p10_error)
         risk_mode = "P90 (Conservative 90% Confidence)"
     else:
-        # P50: median adjustment (if negative bias, compensate by |P50|)
         buffer_mw = abs(p50_error) if p50_error < 0 else 0.0
         risk_mode = "P50 (Median Central Hedge)"
 
-    # Effective hedged wind capacity
     hedged_wind = max(0.0, expected_wind - buffer_mw)
     thermal_procurement = max(0.0, req.consumer_demand_mw - hedged_wind)
 
-    # Outturn evaluation if actual wind is known
     unhedged_exposure = None
     imbalance_risk = "LOW"
     rationale = ""
 
     if actual_wind is not None:
         actual_total_procured = thermal_procurement + actual_wind
-        unhedged_exposure = actual_total_procured - req.consumer_demand_mw  # Positive = Long, Negative = Short
+        unhedged_exposure = actual_total_procured - req.consumer_demand_mw
 
         if unhedged_exposure < -500:
             imbalance_risk = "CRITICAL SHORT"
@@ -318,14 +326,23 @@ def simulate_procurement(
         rationale=rationale
     )
 
-# Static files for frontend build in production
-FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "frontend", "dist")
+# MOUNT ON BOTH "/api" AND "/" TO GUARANTEE COMPATIBILITY ACROSS ALL VERCEL REWRITE MODES
+app.include_router(router, prefix="/api")
+app.include_router(router)
+
+# Static files for frontend build in production / local docker
+FRONTEND_DIST = os.path.join(repo_root, "frontend", "dist")
 if os.path.exists(FRONTEND_DIST):
-    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+    assets_dir = os.path.join(FRONTEND_DIST, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         file_path = os.path.join(FRONTEND_DIST, full_path)
         if os.path.exists(file_path) and os.path.isfile(file_path):
             return FileResponse(file_path)
-        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+        index_file = os.path.join(FRONTEND_DIST, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file)
+        return {"error": "Frontend build not found"}
