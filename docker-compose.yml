@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  trading-desk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: uk_energy_trading_desk
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=8000
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
